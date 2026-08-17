@@ -1,6 +1,6 @@
 --- @since 26.5.6
 -- 电子书分页预览:1 封面 / 2 元信息(标题/作者等) / 3 正文开头
--- 支持 epub / mobi / azw3 / fb2(纯 Python 标准库,零外部依赖)
+-- 支持 epub / mobi / azw3 / fb2(纯 Python 标准库,零外部依赖,解析 ~30ms 无需缓存)
 -- 分页状态编码在 job.skip 里(参照内置 code 预览器):0=封面 1=元信息 2=正文
 -- 文本页渲染前用 ui.Clear 擦除残留封面图像(图像/文本是两个独立层)
 -- 依赖外部命令 epub-preview(见本插件 scripts/ 目录,需安装到 PATH)
@@ -9,18 +9,17 @@ local M = {}
 local PAGE_COUNT = 3
 local MISSING_MSG = "[epub-preview] 未找到 epub-preview 命令,请先把本插件 scripts/epub-preview 安装到 PATH(如 ~/.local/bin)"
 
-local function run_text(job, sub, cache)
+local function run_text(job, sub)
 	-- 文本层渲染前先擦掉残留的封面图像(ui.Clear 会 image_erase 重叠区域)
 	local widgets = { ui.Clear(job.area) }
 
-	local cmd = Command("epub-preview")
+	local child = Command("epub-preview")
 		:arg(sub)
 		:arg(tostring(job.file.url))
 		:arg(tostring(job.area.w))
-	if cache and cache ~= "" then
-		cmd = cmd:arg(cache)
-	end
-	local child = cmd:stdout(Command.PIPED):stderr(Command.PIPED):spawn()
+		:stdout(Command.PIPED)
+		:stderr(Command.PIPED)
+		:spawn()
 	if not child then
 		widgets[#widgets + 1] = ui.Text(MISSING_MSG):area(job.area)
 		ya.preview_widget(job, widgets)
@@ -29,6 +28,7 @@ local function run_text(job, sub, cache)
 
 	local output, err = child:wait_with_output()
 	if not output then
+		widgets[#widgets + 1] = ui.Text("epub-preview 执行失败: " .. tostring(err)):area(job.area)
 		ya.preview_widget(job, widgets)
 		return
 	end
@@ -41,20 +41,12 @@ local function run_text(job, sub, cache)
 	ya.preview_widget(job, widgets)
 end
 
-local function cache_path(job, suffix)
-	local cache = ya.file_cache { file = job.file }
-	if not cache then
-		return nil
-	end
-	return tostring(cache) .. suffix
-end
-
 local function peek_meta(job)
-	run_text(job, "meta", cache_path(job, ".meta.txt"))
+	run_text(job, "meta")
 end
 
 local function peek_text(job)
-	run_text(job, "text", cache_path(job, ".text.txt"))
+	run_text(job, "text")
 end
 
 local function peek_cover(job)
@@ -82,15 +74,15 @@ local function peek_cover(job)
 
 	local area, err = ya.image_show(Url(cover), job.area)
 	if not area then
-		-- 图像显示失败:回退元信息,并附上错误原因
-		run_text(job, "meta", cache_path(job, ".meta.txt"))
+		-- 图像显示失败:回退元信息
+		run_text(job, "meta")
 		return
 	end
 	-- 清掉可能残留的文本层(不带 Clear,保留图像)
 	ya.preview_widget(job, {})
 end
 
-function M:peek(job)
+local function render(job)
 	local page = (job.skip or 0) % PAGE_COUNT + 1
 	if page == 1 then
 		peek_cover(job)
@@ -99,6 +91,10 @@ function M:peek(job)
 	else
 		peek_text(job)
 	end
+end
+
+function M:peek(job)
+	render(job)
 end
 
 function M:seek(job)
