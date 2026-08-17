@@ -1,25 +1,26 @@
 --- @since 26.5.6
--- 电子书分页预览:1 封面 / 2 元信息(标题/作者等) / 3 正文开头
+-- 电子书分页预览:1 封面 / 2 元信息(标题/作者等) / 3+ 正文(每页 TEXT_CHARS,可一直往下翻)
 -- 支持 epub / mobi / azw3 / fb2(纯 Python 标准库,零外部依赖,解析 ~30ms 无需缓存)
--- 分页状态编码在 job.skip 里(参照内置 code 预览器):0=封面 1=元信息 2=正文
+-- 分页状态编码在 job.skip 里(参照内置 code 预览器):0=封面 1=元信息 >=2=正文第 N 页
 -- 文本页渲染前用 ui.Clear 擦除残留封面图像(图像/文本是两个独立层)
 -- 依赖外部命令 epub-preview(见本插件 scripts/ 目录,需安装到 PATH)
 local M = {}
 
-local PAGE_COUNT = 3
+local TEXT_CHARS = 3000
 local MISSING_MSG = "[epub-preview] 未找到 epub-preview 命令,请先把本插件 scripts/epub-preview 安装到 PATH(如 ~/.local/bin)"
 
-local function run_text(job, sub)
+local function run_text(job, sub, offset)
 	-- 文本层渲染前先擦掉残留的封面图像(ui.Clear 会 image_erase 重叠区域)
 	local widgets = { ui.Clear(job.area) }
 
-	local child = Command("epub-preview")
+	local cmd = Command("epub-preview")
 		:arg(sub)
 		:arg(tostring(job.file.url))
 		:arg(tostring(job.area.w))
-		:stdout(Command.PIPED)
-		:stderr(Command.PIPED)
-		:spawn()
+	if sub == "text" then
+		cmd = cmd:arg(tostring(TEXT_CHARS)):arg(tostring(offset or 0))
+	end
+	local child = cmd:stdout(Command.PIPED):stderr(Command.PIPED):spawn()
 	if not child then
 		widgets[#widgets + 1] = ui.Text(MISSING_MSG):area(job.area)
 		ya.preview_widget(job, widgets)
@@ -42,11 +43,7 @@ local function run_text(job, sub)
 end
 
 local function peek_meta(job)
-	run_text(job, "meta")
-end
-
-local function peek_text(job)
-	run_text(job, "text")
+	run_text(job, "meta", 0)
 end
 
 local function peek_cover(job)
@@ -75,26 +72,23 @@ local function peek_cover(job)
 	local area, err = ya.image_show(Url(cover), job.area)
 	if not area then
 		-- 图像显示失败:回退元信息
-		run_text(job, "meta")
+		peek_meta(job)
 		return
 	end
 	-- 清掉可能残留的文本层(不带 Clear,保留图像)
 	ya.preview_widget(job, {})
 end
 
-local function render(job)
-	local page = (job.skip or 0) % PAGE_COUNT + 1
-	if page == 1 then
+function M:peek(job)
+	local skip = job.skip or 0
+	if skip == 0 then
 		peek_cover(job)
-	elseif page == 2 then
+	elseif skip == 1 then
 		peek_meta(job)
 	else
-		peek_text(job)
+		-- 正文页:每页 TEXT_CHARS,offset = (skip-2) * TEXT_CHARS
+		run_text(job, "text", (skip - 2) * TEXT_CHARS)
 	end
-end
-
-function M:peek(job)
-	render(job)
 end
 
 function M:seek(job)
@@ -105,7 +99,7 @@ function M:seek(job)
 
 	local skip = cx.active.preview.skip or 0
 	local next_skip = skip + (job.units > 0 and 1 or -1)
-	if next_skip < 0 or next_skip >= PAGE_COUNT then
+	if next_skip < 0 then
 		return
 	end
 
