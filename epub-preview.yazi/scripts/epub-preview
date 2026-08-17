@@ -1,0 +1,629 @@
+#!/usr/bin/env python3
+"""电子书分页预览后端 —— 纯 Python 标准库,零第三方依赖、零外部命令。
+格式支持:
+  epub  : zip + OPF 解析(元信息/封面/正文)
+  mobi  : PalmDB + MOBI header + EXTH(元信息/封面)+ PalmDoc 变体解压(正文)
+  azw3  : 同 mobi(PalmDoc 压缩的 KF8 分片)
+  fb2   : FictionBook XML 解析
+用法:
+  epub-preview cover <file> <out>                   # 提取封面(无封面退出码 1)
+  epub-preview meta <file> [宽度] [缓存txt]          # 元信息文本
+  epub-preview text <file> [宽度] [字符数] [缓存txt]  # 正文开头
+"""
+import base64
+import os
+import re
+import struct
+import sys
+import zipfile
+import unicodedata
+import urllib.parse
+import xml.etree.ElementTree as ET
+
+OPF_NS = "http://www.idpf.org/2007/opf"
+CONTAINER_NS = "urn:oasis:names:tc:opendocument:xmlns:container"
+XHTML_NS = "http://www.w3.org/1999/xhtml"
+FB2_NS = "http://www.gribuser.ru/xml/fictionbook/2.0"
+
+# 语言代码 -> 中文
+LANG_MAP = {"zh": "中文", "zho": "中文", "chi": "中文", "jpn": "日语", "eng": "英语",
+            "kor": "韩语", "fra": "法语", "deu": "德语", "rus": "俄语", "spa": "西语",
+            "ita": "意语"}
+
+
+# ==================== 格式检测 ====================
+
+def is_epub(path: str) -> bool:
+    try:
+        with zipfile.ZipFile(path) as zf:
+            return "META-INF/container.xml" in zf.namelist()
+    except Exception:
+        return False
+
+
+def is_mobi(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(78 + 8)
+        if len(head) < 78:
+            return False
+        n = struct.unpack_from(">H", head, 76)[0]
+        if n < 1 or len(head) < 78 + 8:
+            return False
+        r0_off = struct.unpack_from(">I", head, 78)[0]
+        with open(path, "rb") as f:
+            f.seek(r0_off)
+            r0 = f.read(0x40)
+        return r0[:8] in (b"BOOKMOBI", b"TEXtREAd") or r0[0x10:0x14] == b"MOBI"
+    except Exception:
+        return False
+
+
+def is_fb2(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+        return head.lstrip()[:5] == b"<?xml" and b"FictionBook" in head[:1024]
+    except Exception:
+        return False
+
+
+# ==================== epub 后端 ====================
+
+def find_opf(zf: zipfile.ZipFile) -> str:
+    try:
+        root = ET.fromstring(zf.read("META-INF/container.xml"))
+    except KeyError:
+        for n in zf.namelist():
+            if n.lower().endswith(".opf"):
+                return n
+        raise RuntimeError("container.xml 不存在")
+    for rf in root.iter(f"{{{CONTAINER_NS}}}rootfile"):
+        p = rf.get("full-path")
+        if p:
+            return p
+    raise RuntimeError("container.xml 里没有 rootfile")
+
+
+def strip_ns(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def join_path(base: str, href: str) -> str:
+    href = urllib.parse.unquote(href.split("#", 1)[0])
+    path = f"{base}/{href}" if base else href
+    path = re.sub(r"/{2,}", "/", path)
+    return path.lstrip("/")
+
+
+def get_metadata(zf: zipfile.ZipFile, opf_path: str) -> dict:
+    root = ET.fromstring(zf.read(opf_path))
+    meta = {"title": [], "creator": [], "publisher": [], "language": [], "date": []}
+    for el in root.iter():
+        if not isinstance(el.tag, str):
+            continue
+        local = strip_ns(el.tag)
+        if local in meta:
+            txt = (el.text or "").strip()
+            if txt:
+                meta[local].append(txt)
+    return {k: v[0] if v else "" for k, v in meta.items()}
+
+
+def find_cover(zf: zipfile.ZipFile, opf_path: str):
+    root = ET.fromstring(zf.read(opf_path))
+    base = opf_path.rsplit("/", 1)[0]
+    manifest = {}
+    cover_id = None
+    for el in root.iter():
+        if not isinstance(el.tag, str):
+            continue
+        local = strip_ns(el.tag)
+        if local == "meta" and el.get("name") == "cover":
+            cover_id = el.get("content")
+        elif local == "item":
+            manifest[el.get("id")] = el.get("href", "")
+            if "cover-image" in (el.get("properties") or "").split():
+                cover_id = cover_id or el.get("id")
+    if cover_id and cover_id in manifest:
+        return join_path(base, manifest[cover_id])
+    return None
+
+
+def epub_cover(path: str, out_path: str) -> int:
+    with zipfile.ZipFile(path) as zf:
+        rel = find_cover(zf, find_opf(zf))
+        if not rel:
+            return 1
+        try:
+            data = zf.read(rel)
+        except KeyError:
+            return 1
+        if not data:
+            return 1
+        tmp = out_path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, out_path)
+        return 0
+
+
+def html_to_text(raw) -> str:
+    txt = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+    txt = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", txt)
+    txt = re.sub(r"(?i)</(p|div|h[1-6]|li|br|tr|blockquote|section|article)>", "\n", txt)
+    txt = re.sub(r"(?i)<br\s*/?>", "\n", txt)
+    txt = re.sub(r"<[^>]+>", "", txt)
+    txt = re.sub(r"&nbsp;?", " ", txt)
+    txt = re.sub(r"&amp;", "&", txt)
+    txt = re.sub(r"&lt;", "<", txt)
+    txt = re.sub(r"&gt;", ">", txt)
+    txt = re.sub(r"&quot;", '"', txt)
+    txt = re.sub(r"&#(\d+);", lambda m: chr(int(m.group(1))), txt)
+    txt = re.sub(r"[ \t]+\n", "\n", txt)
+    txt = re.sub(r"\n{3,}", "\n\n", txt)
+    return txt.strip()
+
+
+def chapter_texts(zf: zipfile.ZipFile, opf_path: str):
+    root = ET.fromstring(zf.read(opf_path))
+    base = opf_path.rsplit("/", 1)[0]
+    manifest, candidates = {}, []
+    for el in root.iter():
+        if not isinstance(el.tag, str):
+            continue
+        local = strip_ns(el.tag)
+        if local == "item":
+            manifest[el.get("id")] = el.get("href", "")
+        elif local == "itemref":
+            href = manifest.get(el.get("idref"))
+            if href:
+                candidates.append(href)
+    if not candidates:
+        candidates = [n for n in zf.namelist()
+                      if n.lower().endswith((".xhtml", ".html", ".htm"))]
+    for href in candidates:
+        try:
+            raw = zf.read(join_path(base, href))
+        except KeyError:
+            continue
+        text = html_to_text(raw)
+        if text.strip():
+            yield text
+
+
+def epub_meta_text(path: str) -> list:
+    with zipfile.ZipFile(path) as zf:
+        meta = get_metadata(zf, find_opf(zf))
+    labels = [("标题", meta["title"]), ("作者", meta["creator"]),
+              ("出版社", meta["publisher"]),
+              ("语言", LANG_MAP.get(meta["language"].lower(), meta["language"])),
+              ("日期", meta["date"])]
+    return [f"◆ {k}: {v}" for k, v in labels if v] or ["(无元信息)"]
+
+
+def epub_body_text(path: str) -> str:
+    with zipfile.ZipFile(path) as zf:
+        opf = find_opf(zf)
+        for t in chapter_texts(zf, opf):
+            if len(t) > 200:
+                return t
+    return "(未找到正文)"
+
+
+# ==================== mobi/azw3 后端 ====================
+
+class MobiError(Exception):
+    pass
+
+
+class Mobi:
+    def __init__(self, path: str):
+        with open(path, "rb") as f:
+            self.data = f.read()
+        self.parse_palmdb()
+        self.parse_mobi_header()
+        self.parse_exth()
+
+    def parse_palmdb(self):
+        d = self.data
+        if len(d) < 78:
+            raise MobiError("文件过小,不是 PalmDB 格式")
+        self.num_records = struct.unpack_from(">H", d, 76)[0]
+        if self.num_records == 0 or len(d) < 78 + 8 * self.num_records:
+            raise MobiError("记录表损坏")
+        self.records = [struct.unpack_from(">I", d, 78 + i * 8)[0]
+                        for i in range(self.num_records)]
+
+    def parse_mobi_header(self):
+        if self.num_records < 1:
+            raise MobiError("无记录")
+        r0 = self.data[self.records[0]:]
+        # 两种 record 0 布局:
+        # A) PalmDOC header 直接开始(compression@0x00, "MOBI"@0x10)
+        # B) 8 字节 magic(BOOKMOBI/TEXtREAd)开头,字段整体 +8
+        base = 8 if r0[:8] in (b"BOOKMOBI", b"TEXtREAd") else 0
+        # 所有 MOBI header 字段以 "MOBI" 标识位置为基准
+        mobi = base + 0x10
+        if r0[mobi:mobi + 4] != b"MOBI":
+            raise MobiError("不是 Mobipocket 书(record 0 无 MOBI 标识)")
+        self.mobi_pos = mobi
+        self.compression = struct.unpack_from(">H", r0, base + 0x00)[0]
+        self.encoding = struct.unpack_from(">I", r0, mobi + 0x0C)[0]
+        self.header_length = struct.unpack_from(">I", r0, mobi + 0x04)[0]
+        self.first_image_index = struct.unpack_from(">I", r0, mobi + 0x64)[0]
+        self.full_name_off = struct.unpack_from(">I", r0, mobi + 0x4C)[0]
+        self.full_name_len = struct.unpack_from(">I", r0, mobi + 0x50)[0]
+        if self.full_name_off and self.full_name_len:
+            try:
+                self.title = r0[self.full_name_off:self.full_name_off + self.full_name_len] \
+                    .decode("utf-8", "replace").strip("\x00")
+            except Exception:
+                self.title = ""
+        else:
+            self.title = ""
+
+    def parse_exth(self):
+        self.exth = {}
+        # 不依赖 exth_flags(实测 calibre 生成文件 flags=0 但 EXTH 存在)
+        r0 = self.data[self.records[0]:]
+        pos = self.mobi_pos + self.header_length
+        if r0[pos:pos + 4] != b"EXTH":
+            return
+        count = struct.unpack_from(">I", r0, pos + 8)[0]
+        pos += 12
+        for _ in range(count):
+            if pos + 8 > len(r0):
+                break
+            etype, elen = struct.unpack_from(">II", r0, pos)
+            if elen < 8 or pos + elen > len(r0):
+                break
+            val = r0[pos + 8:pos + elen].decode("utf-8", "replace").strip("\x00")
+            self.exth.setdefault(etype, []).append(val)
+            pos += elen
+
+    @property
+    def meta(self):
+        def first(*types):
+            for t in types:
+                if t in self.exth and self.exth[t]:
+                    return self.exth[t][0]
+            return ""
+
+        return {
+            "title": first(503, 500) or self.title,
+            "author": first(100),
+            "publisher": first(101),
+            "date": (first(106) or "")[:10],
+            "language": first(524),
+            "tags": first(105),
+        }
+
+    def body_html(self, max_records: int = 20) -> str:
+        """解压正文记录拼成 HTML 流(到 first_image_index 或记录末尾)。
+        默认只取前 20 条记录(第一章内容),保证预览秒开。
+        compression=2 是 PalmDoc 压缩(mobi 变体,见 calibre headers.py 与 palmdoc.c);
+        KF8/azw3 每条记录是独立 XML 片段,去掉 xml 声明与 head 段。
+        """
+        end = self.first_image_index or self.num_records
+        if end <= 1:
+            return ""
+        chunks = []
+        for i in range(1, min(end, max_records + 1)):
+            nxt = self.records[i + 1] if i + 1 < self.num_records else len(self.data)
+            raw = self.data[self.records[i]:nxt]
+            if self.compression == 2:
+                raw = palmdoc_decompress(raw)
+            raw = re.sub(rb"<\?xml[^>]*\?>", b"", raw)
+            raw = re.sub(rb"(?is)<head[^>]*>.*?</head>", b"", raw)
+            chunks.append(raw)
+        html = b"".join(chunks)
+        enc = "utf-8" if self.encoding == 65001 else "cp1252"
+        return html.decode(enc, "replace")
+
+    def image_records(self):
+        start = self.first_image_index or 1
+        imgs = []
+        for i in range(start, self.num_records):
+            raw = self.data[self.records[i]:]
+            if raw.startswith((b"\xff\xd8\xff", b"\x89PNG", b"GIF8")):
+                nxt = self.records[i + 1] if i + 1 < self.num_records else len(self.data)
+                imgs.append((i, raw[:nxt - self.records[i]]))
+        return imgs
+
+    def cover_data(self):
+        imgs = self.image_records()
+        if not imgs:
+            return None
+        # EXTH 201:封面相对第一条图像记录的偏移
+        cov = self.exth.get(201, [None])[0]
+        if cov is not None:
+            try:
+                base = self.first_image_index or imgs[0][0]
+                target = base + int(cov)
+                for idx, data in imgs:
+                    if idx == target:
+                        return data
+            except (TypeError, ValueError):
+                pass
+        # 回退:第一张非占位大图(>10KB),再退回第一张图
+        for _, data in imgs:
+            if len(data) > 10240:
+                return data
+        return imgs[0][1]
+
+
+def palmdoc_decompress(data: bytes) -> bytes:
+    """PalmDoc(mobi 变体)解压,算法对照 calibre src/calibre/ebooks/compression/palmdoc.c
+    0x01-0x08 字面量 N 字节;0x00/0x09-0x7F 字面字符;
+    0x80-0xBF 2 字节重复码(di=(code&0x3FFF)>>3, n=(code&7)+3, 逐字节允许重叠);
+    0xC0-0xFF 空格 + (c^0x80)
+    """
+    out = bytearray()
+    i, n = 0, len(data)
+    while i < n:
+        c = data[i]
+        i += 1
+        if 1 <= c <= 8:
+            if i + c > n:
+                break
+            out += data[i:i + c]
+            i += c
+        elif c <= 0x7F:
+            out.append(c)
+        elif c >= 0xC0:
+            out += b" " + bytes([c ^ 0x80])
+        elif i < n:
+            code = (c << 8) | data[i]
+            i += 1
+            di = (code & 0x3FFF) >> 3
+            if di <= len(out):
+                for _ in range((code & 7) + 3):
+                    out.append(out[len(out) - di] if di else 0)
+    return bytes(out)
+
+
+def mobi_meta_text(path: str) -> list:
+    m = Mobi(path)
+    meta = m.meta
+    labels = [("标题", meta["title"]), ("作者", meta["author"]),
+              ("出版社", meta["publisher"]), ("标签", meta["tags"]),
+              ("语言", LANG_MAP.get(meta["language"].lower(), meta["language"])),
+              ("日期", meta["date"])]
+    return [f"◆ {k}: {v}" for k, v in labels if v] or ["(无元信息)"]
+
+
+def mobi_cover(path: str, out_path: str) -> int:
+    data = Mobi(path).cover_data()
+    if not data:
+        return 1
+    tmp = out_path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, out_path)
+    return 0
+
+
+def mobi_body_text(path: str) -> str:
+    html = Mobi(path).body_html()
+    return html_to_text(html)
+
+
+# ==================== fb2 后端 ====================
+
+def fb2_root(path: str):
+    # fb2 有命名空间时剥掉(元素与属性)
+    tree = ET.parse(path)
+    root = tree.getroot()
+    if root.tag.startswith("{"):
+        ns = root.tag.split("}", 1)[0] + "}"
+        for el in root.iter():
+            el.tag = el.tag.replace(ns, "", 1)
+            if el.attrib:
+                el.attrib = {k.replace(ns, "", 1): v for k, v in el.attrib.items()}
+    return root
+
+
+def fb2_find(root, *names):
+    for el in root.iter():
+        if el.tag in names and (el.text or "").strip():
+            return el.text.strip()
+    return ""
+
+
+def fb2_meta_text(path: str) -> list:
+    root = fb2_root(path)
+    title = fb2_find(root, "book-title")
+    author = " ".join(x for x in (fb2_find(root, "first-name"),
+                                  fb2_find(root, "last-name")) if x)
+    publisher = fb2_find(root, "publisher")
+    lang = fb2_find(root, "lang")
+    date = fb2_find(root, "date")[:10]
+    labels = [("标题", title), ("作者", author), ("出版社", publisher),
+              ("语言", LANG_MAP.get(lang.lower(), lang)), ("日期", date)]
+    return [f"◆ {k}: {v}" for k, v in labels if v] or ["(无元信息)"]
+
+
+def fb2_cover(path: str, out_path: str) -> int:
+    root = fb2_root(path)
+    # coverpage/image 的 href(xlink:href)指向 #id,id 对应 binary 节点(base64)
+    href = ""
+    for el in root.iter():
+        if el.tag == "image":
+            href = el.get("href") or el.get("{http://www.w3.org/1999/xlink}href") or ""
+            if href.startswith("#"):
+                break
+    href = href[1:] if href.startswith("#") else ""
+    if not href:
+        return 1
+    for el in root.iter():
+        if el.tag == "binary" and el.get("id") == href and el.text:
+            try:
+                data = base64.b64decode("".join(el.text.split()))
+            except Exception:
+                return 1
+            if not data:
+                return 1
+            tmp = out_path + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, out_path)
+            return 0
+    return 1
+
+
+def fb2_body_text(path: str) -> str:
+    root = fb2_root(path)
+    paras = []
+    for el in root.iter():
+        if el.tag == "p" and (el.text or "").strip():
+            paras.append(el.text.strip())
+        elif el.tag == "title" and (el.text or "").strip():
+            paras.append(el.text.strip())
+    text = "\n".join(paras)
+    return text[:8000] if text else "(未找到正文)"
+
+
+# ==================== 公共 ====================
+
+def disp_w(ch: str) -> int:
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def wrap_by_width(text: str, width: int) -> list:
+    lines = []
+    for para in text.split("\n"):
+        if not para.strip():
+            lines.append("")
+            continue
+        cur, cur_w = "", 0
+        for ch in para:
+            w = disp_w(ch)
+            if cur_w + w > width:
+                lines.append(cur)
+                cur, cur_w = ch, w
+            else:
+                cur += ch
+                cur_w += w
+        lines.append(cur)
+    return lines
+
+
+def detect(path: str) -> str:
+    if is_epub(path):
+        return "epub"
+    if is_mobi(path):
+        return "mobi"
+    if is_fb2(path):
+        return "fb2"
+    return "unknown"
+
+
+def cmd_cover(args):
+    if len(args) < 2:
+        print("用法: epub-preview cover <file> <out>", file=sys.stderr)
+        return 2
+    path, out = args[0], args[1]
+    try:
+        kind = detect(path)
+        if kind == "epub":
+            return epub_cover(path, out)
+        if kind == "mobi":
+            return mobi_cover(path, out)
+        if kind == "fb2":
+            return fb2_cover(path, out)
+        print("[epub-preview] 不支持的格式", file=sys.stderr)
+        return 3
+    except Exception as e:
+        print(f"[epub-preview] cover 失败: {e}", file=sys.stderr)
+        return 2
+
+
+def load_or_build_meta(path: str, cache_path: str, kind: str) -> list:
+    """有缓存读缓存,否则重新生成并写缓存"""
+    if cache_path and os.path.exists(cache_path):
+        with open(cache_path, encoding="utf-8", errors="replace") as f:
+            return f.read().splitlines() or ["(空缓存)"]
+    if kind == "epub":
+        lines = epub_meta_text(path)
+    elif kind == "mobi":
+        lines = mobi_meta_text(path)
+    else:
+        lines = fb2_meta_text(path)
+    if cache_path:
+        try:
+            with open(cache_path + ".tmp", "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            os.replace(cache_path + ".tmp", cache_path)
+        except OSError:
+            pass
+    return lines
+
+
+def cmd_meta(args):
+    if not args:
+        print("用法: epub-preview meta <file> [宽度] [缓存txt]", file=sys.stderr)
+        return 2
+    path = args[0]
+    width = int(args[1]) if len(args) > 1 else 80
+    cache = args[2] if len(args) > 2 else ""
+    try:
+        kind = detect(path)
+        if kind == "unknown":
+            print("[epub-preview] 不支持的格式", file=sys.stderr)
+            return 3
+        lines = load_or_build_meta(path, cache, kind)
+    except Exception as e:
+        print(f"[epub-preview] meta 失败: {e}")
+        return 2
+    for line in lines:
+        for wl in wrap_by_width(line, width):
+            print(wl)
+    return 0
+
+
+def body_text(path: str, kind: str) -> str:
+    if kind == "epub":
+        return epub_body_text(path)
+    if kind == "mobi":
+        return mobi_body_text(path)
+    return fb2_body_text(path)
+
+
+def cmd_text(args):
+    if not args:
+        print("用法: epub-preview text <file> [宽度] [字符数] [缓存txt]", file=sys.stderr)
+        return 2
+    path = args[0]
+    width = int(args[1]) if len(args) > 1 else 80
+    maxchars = int(args[2]) if len(args) > 2 else 3000
+    try:
+        kind = detect(path)
+        if kind == "unknown":
+            print("[epub-preview] 不支持的格式", file=sys.stderr)
+            return 3
+        body = body_text(path, kind)
+    except Exception as e:
+        print(f"[epub-preview] text 失败: {e}")
+        return 2
+    print("\n".join(wrap_by_width(body[:maxchars], width)))
+    return 0
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    cmd, args = sys.argv[1], sys.argv[2:]
+    if cmd == "cover":
+        return cmd_cover(args)
+    if cmd == "meta":
+        return cmd_meta(args)
+    if cmd == "text":
+        return cmd_text(args)
+    print(f"未知子命令: {cmd}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
