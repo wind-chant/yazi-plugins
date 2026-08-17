@@ -9,6 +9,14 @@ local M = {}
 
 local MISSING_MSG = "[epub-preview] 未找到 epub-preview 命令,请先把本插件 scripts/epub-preview 安装到 PATH(如 ~/.local/bin)"
 
+local function cache_path(job, suffix)
+	local cache = ya.file_cache { file = job.file }
+	if not cache then
+		return nil
+	end
+	return tostring(cache) .. suffix
+end
+
 local function run_text(job, sub, start_line)
 	-- 文本层渲染前先擦掉残留的封面图像(ui.Clear 会 image_erase 重叠区域)
 	local widgets = { ui.Clear(job.area) }
@@ -18,7 +26,11 @@ local function run_text(job, sub, start_line)
 		:arg(tostring(job.file.url))
 		:arg(tostring(job.area.w))
 	if sub == "text" then
+		local cache = cache_path(job, ".text.txt")
 		cmd = cmd:arg(tostring(start_line or 0)):arg("1000")
+		if cache then
+			cmd = cmd:arg(cache)
+		end
 	end
 	local child = cmd:stdout(Command.PIPED):stderr(Command.PIPED):spawn()
 	if not child then
