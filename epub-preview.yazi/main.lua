@@ -67,7 +67,7 @@ local function peek_cover(job)
 	end
 
 	local cover = tostring(cache) .. ".cover.png"
-	if not fs.cha(cover) then
+	if not fs.cha(Url(cover)) then
 		local child = Command("epub-preview")
 			:args({ "cover", tostring(job.file.url), cover })
 			:spawn()
@@ -76,14 +76,14 @@ local function peek_cover(job)
 			return peek_meta(job)
 		end
 		child:wait()
-		if not fs.cha(cover) then
+		if not fs.cha(Url(cover)) then
 			-- 无封面:校正到元信息页
 			set_page(tostring(job.file.url), 2)
 			return peek_meta(job)
 		end
 	end
 
-	if not ya.image_show(cover, job.area) then
+	if not ya.image_show(Url(cover), job.area) then
 		set_page(tostring(job.file.url), 2)
 		return peek_meta(job)
 	end
