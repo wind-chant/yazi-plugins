@@ -325,10 +325,10 @@ class Mobi:
         start = self.first_image_index or 1
         imgs = []
         for i in range(start, self.num_records):
-            raw = self.data[self.records[i]:]
+            nxt = self.records[i + 1] if i + 1 < self.num_records else len(self.data)
+            raw = self.data[self.records[i]:nxt]
             if raw.startswith((b"\xff\xd8\xff", b"\x89PNG", b"GIF8")):
-                nxt = self.records[i + 1] if i + 1 < self.num_records else len(self.data)
-                imgs.append((i, raw[:nxt - self.records[i]]))
+                imgs.append((i, raw))
         return imgs
 
     def cover_data(self):
