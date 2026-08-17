@@ -17,15 +17,14 @@ local set_page = ya.sync(function(st, url, page)
 end)
 
 local function run_text(job, sub, cache)
-	local args = { sub, tostring(job.file.url), tostring(job.area.w) }
+	local cmd = Command("epub-preview")
+		:arg(sub)
+		:arg(tostring(job.file.url))
+		:arg(tostring(job.area.w))
 	if cache and cache ~= "" then
-		args[#args + 1] = cache
+		cmd = cmd:arg(cache)
 	end
-	local child = Command("epub-preview")
-		:args(args)
-		:stdout(Command.PIPED)
-		:stderr(Command.PIPED)
-		:spawn()
+	local child = cmd:stdout(Command.PIPED):stderr(Command.PIPED):spawn()
 	if not child then
 		ya.preview_widget(job, ui.Text(MISSING_MSG):area(job.area))
 		return
@@ -69,7 +68,9 @@ local function peek_cover(job)
 	local cover = tostring(cache) .. ".cover.png"
 	if not fs.cha(Url(cover)) then
 		local child = Command("epub-preview")
-			:args({ "cover", tostring(job.file.url), cover })
+			:arg("cover")
+			:arg(tostring(job.file.url))
+			:arg(cover)
 			:spawn()
 		if not child then
 			set_page(tostring(job.file.url), 2)
