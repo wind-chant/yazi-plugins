@@ -2,7 +2,7 @@
 -- 电子书分页预览:1 封面 / 2 元信息(标题/作者等) / 3 正文开头
 -- 支持 epub / mobi / azw3 / fb2(纯 Python 标准库,零外部依赖)
 -- 分页状态编码在 job.skip 里(参照内置 code 预览器):0=封面 1=元信息 2=正文
--- 切换文件时 yazi 自动重置 skip=0(见 yazi-core/src/mgr/peek.rs)
+-- 文本页渲染前用 ui.Clear 擦除残留封面图像(图像/文本是两个独立层)
 -- 依赖外部命令 epub-preview(见本插件 scripts/ 目录,需安装到 PATH)
 local M = {}
 
@@ -10,6 +10,9 @@ local PAGE_COUNT = 3
 local MISSING_MSG = "[epub-preview] 未找到 epub-preview 命令,请先把本插件 scripts/epub-preview 安装到 PATH(如 ~/.local/bin)"
 
 local function run_text(job, sub, cache)
+	-- 文本层渲染前先擦掉残留的封面图像(ui.Clear 会 image_erase 重叠区域)
+	local widgets = { ui.Clear(job.area) }
+
 	local cmd = Command("epub-preview")
 		:arg(sub)
 		:arg(tostring(job.file.url))
@@ -19,13 +22,14 @@ local function run_text(job, sub, cache)
 	end
 	local child = cmd:stdout(Command.PIPED):stderr(Command.PIPED):spawn()
 	if not child then
-		ya.preview_widget(job, ui.Text(MISSING_MSG):area(job.area))
+		widgets[#widgets + 1] = ui.Text(MISSING_MSG):area(job.area)
+		ya.preview_widget(job, widgets)
 		return
 	end
 
 	local output, err = child:wait_with_output()
 	if not output then
-		ya.preview_widget(job, {})
+		ya.preview_widget(job, widgets)
 		return
 	end
 
@@ -33,7 +37,8 @@ local function run_text(job, sub, cache)
 	for line in output.stdout:gmatch("[^\r\n]+") do
 		lines[#lines + 1] = line
 	end
-	ya.preview_widget(job, ui.Text(lines):area(job.area))
+	widgets[#widgets + 1] = ui.Text(lines):area(job.area)
+	ya.preview_widget(job, widgets)
 end
 
 local function cache_path(job, suffix)
@@ -75,10 +80,13 @@ local function peek_cover(job)
 		end
 	end
 
-	if not ya.image_show(Url(cover), job.area) then
-		return peek_meta(job)
+	local area, err = ya.image_show(Url(cover), job.area)
+	if not area then
+		-- 图像显示失败:回退元信息,并附上错误原因
+		run_text(job, "meta", cache_path(job, ".meta.txt"))
+		return
 	end
-	-- 清掉可能残留的文本层
+	-- 清掉可能残留的文本层(不带 Clear,保留图像)
 	ya.preview_widget(job, {})
 end
 
