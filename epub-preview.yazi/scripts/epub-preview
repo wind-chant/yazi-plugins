@@ -205,10 +205,10 @@ def epub_meta_text(path: str) -> list:
 def epub_body_text(path: str) -> str:
     with zipfile.ZipFile(path) as zf:
         opf = find_opf(zf)
-        for t in chapter_texts(zf, opf):
-            if len(t) > 200:
-                return t
-    return "(未找到正文)"
+        parts = [t for t in chapter_texts(zf, opf)]
+    # 跳过封面/版权等短章节,拼接全书正文
+    body = "\n\n".join(t for t in parts if len(t) > 200)
+    return body or "(未找到正文)"
 
 
 # ==================== mobi/azw3 后端 ====================
@@ -299,17 +299,24 @@ class Mobi:
             "tags": first(105),
         }
 
-    def body_html(self, max_records: int = 20) -> str:
-        """解压正文记录拼成 HTML 流(到 first_image_index 或记录末尾)。
-        默认只取前 20 条记录(第一章内容),保证预览秒开。
-        compression=2 是 PalmDoc 压缩(mobi 变体,见 calibre headers.py 与 palmdoc.c);
-        KF8/azw3 每条记录是独立 XML 片段,去掉 xml 声明与 head 段。
+    def body_html(self, max_records: int = 0) -> str:
+        """解压正文记录拼成 HTML 流(到第一条图片记录或 first_image_index)。
+        max_records=0 表示不限;compression=2 是 PalmDoc 压缩(mobi 变体,
+        见 calibre headers.py 与 palmdoc.c);KF8/azw3 每条记录是独立 XML
+        片段,去掉 xml 声明与 head 段。first_image_index 可能为 0,此时
+        用第一条图片 magic 记录的位置作为正文边界,避免解压图片记录。
         """
         end = self.first_image_index or self.num_records
+        if end == self.num_records:
+            imgs = self.image_records()
+            if imgs:
+                end = imgs[0][0]
         if end <= 1:
             return ""
+        if max_records > 0:
+            end = min(end, max_records + 1)
         chunks = []
-        for i in range(1, min(end, max_records + 1)):
+        for i in range(1, end):
             nxt = self.records[i + 1] if i + 1 < self.num_records else len(self.data)
             raw = self.data[self.records[i]:nxt]
             if self.compression == 2:
@@ -481,7 +488,7 @@ def fb2_body_text(path: str) -> str:
         elif el.tag == "title" and (el.text or "").strip():
             paras.append(el.text.strip())
     text = "\n".join(paras)
-    return text[:8000] if text else "(未找到正文)"
+    return text if text else "(未找到正文)"
 
 
 # ==================== 公共 ====================
