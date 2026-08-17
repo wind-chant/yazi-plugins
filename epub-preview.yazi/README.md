@@ -31,11 +31,18 @@ install -Dm755 ~/.config/yazi/plugins/epub-preview.yazi/scripts/epub-preview ~/.
 [plugin]
 prepend_previewers = [
   { mime = "application/epub+zip", run = "epub-preview" },
-  { mime = "application/x-mobipocket-ebook", run = "epub-preview" },
-  { url = "*.fb2", run = "epub-preview" },
-  { url = "*.azw", run = "epub-preview" },
+  { mime = "application/mobipocket-ebook", run = "epub-preview" },
+  { url = "*.epub", run = "epub-preview" },
+  { url = "*.mobi", run = "epub-preview" },
+  { url = "*.azw",  run = "epub-preview" },
+  { url = "*.azw3", run = "epub-preview" },
+  { url = "*.fb2",  run = "epub-preview" },
 ]
 ```
+
+> 注意:yazi 内置 mime 检测会把 `x-` / `vnd.` 前缀剥掉(见 `mime-local.lua`),
+> 所以 mobi 的 mime 要写 `application/mobipocket-ebook` 而不是
+> `application/x-mobipocket-ebook`;url 扩展名匹配是最保险的兜底。
 
 ## 使用
 
