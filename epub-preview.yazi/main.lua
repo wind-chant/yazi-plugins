@@ -2,7 +2,7 @@
 -- 电子书分页预览:1 封面 / 2 元信息(标题/作者等) / 3+ 正文(行级滚动,与内置 txt 预览器一致)
 -- 支持 epub / mobi / azw3 / fb2(纯 Python 标准库,零外部依赖,解析 ~30ms)
 -- skip 编码:0=封面 1=元信息 >=2=正文起始行号(skip-2)
--- 滚动:封面/元信息页 J/K 切换页面;正文页行级滚动(J=5 行,滚轮=1 行,units 直通)
+-- 滚动:封面/元信息页 J/K 切换页面;正文滚轮逐行、J/K 整页翻动
 -- 文本页渲染前用 ui.Clear 擦除残留封面图像(图像/文本是两个独立层)
 -- 依赖外部命令 epub-preview(见本插件 scripts/ 目录,需安装到 PATH)
 local M = {}
@@ -15,6 +15,49 @@ local function cache_path(job, suffix)
 		return nil
 	end
 	return tostring(cache) .. suffix
+end
+
+local function img_fallback(job, zip_path)
+	-- 插图显示失败:回退为提示行(并擦除可能残留的图像层)
+	local widgets = {
+		ui.Clear(job.area),
+		ui.Text({ "[插图: " .. zip_path .. "]" }):area(job.area),
+	}
+	ya.preview_widget(job, widgets)
+end
+
+local function show_img(job, zip_path)
+	local cache = ya.file_cache { file = job.file }
+	if not cache then
+		img_fallback(job, zip_path)
+		return
+	end
+
+	local child = Command("epub-preview")
+		:arg("img")
+		:arg(tostring(job.file.url))
+		:arg(zip_path)
+		:arg(tostring(cache))
+		:stdout(Command.PIPED):stderr(Command.PIPED):spawn()
+	if not child then
+		img_fallback(job, zip_path)
+		return
+	end
+
+	local output, err = child:wait_with_output()
+	local img_file = output and output.stdout:gsub("%s+$", "") or ""
+	if not output or img_file == "" or not fs.cha(Url(img_file)) then
+		img_fallback(job, zip_path)
+		return
+	end
+
+	local area, ierr = ya.image_show(Url(img_file), job.area)
+	if not area then
+		img_fallback(job, zip_path)
+		return
+	end
+	-- 图像层显示成功:清掉残留的文本层(不带 Clear,保留图像)
+	ya.preview_widget(job, {})
 end
 
 local function run_text(job, sub, start_line)
@@ -46,9 +89,30 @@ local function run_text(job, sub, start_line)
 		return
 	end
 
+	-- 不能用 "[^\r\n]+"：那会吞掉空行，而 job.skip 仍把空行计数。
+	-- 必须保留空行，否则滚到空行时相邻两个 offset 会渲染同一屏内容。
 	local lines = {}
-	for line in output.stdout:gmatch("[^\r\n]+") do
+	local text = output.stdout:gsub("\r\n", "\n")
+	for line in (text .. "\n"):gmatch("(.-)\n") do
 		lines[#lines + 1] = line
+	end
+	-- 上面的补换行会在 stdout 原本以换行结尾时多捕获一个尾空行；它不影响
+	-- 普通正文页，但移除以避免末尾多出无意义的一次滚动。
+	if text:sub(-1) == "\n" then
+		table.remove(lines)
+	end
+	-- 图片标记行:整页显示插图,滚动经过时像封面一样占一"页"
+	local mark = lines[1] and lines[1]:match("^\x1fIMG:(.-)\x1f$")
+	if mark then
+		show_img(job, mark)
+		return
+	end
+
+	-- 普通文本页:标记行显示为插图提示
+	for i, ln in ipairs(lines) do
+		if ln:match("^\x1fIMG:") then
+			lines[i] = "[插图]"
+		end
 	end
 	widgets[#widgets + 1] = ui.Text(lines):area(job.area)
 	ya.preview_widget(job, widgets)
@@ -115,8 +179,12 @@ function M:seek(job)
 		-- 封面/元信息页:J 下一页,K 上一页
 		next_skip = skip + (job.units > 0 and 1 or -1)
 	else
-		-- 正文页:行级滚动,J(units=5)下 5 行,滚轮(units=1)下 1 行
-		next_skip = skip + job.units
+		-- 正文：滚轮保持逐行；J/K（units 绝对值大于 1）整页翻动。
+		local step = job.units
+		if math.abs(job.units) > 1 then
+			step = job.units > 0 and job.area.h or -job.area.h
+		end
+		next_skip = skip + step
 		if next_skip <= 1 then
 			next_skip = 1 -- 滚回顶部时停到元信息页
 		end

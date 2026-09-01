@@ -11,7 +11,9 @@
   epub-preview text <file> [宽度] [字符数] [缓存txt]  # 正文开头
 """
 import base64
+import hashlib
 import os
+import posixpath
 import re
 import struct
 import sys
@@ -29,6 +31,15 @@ FB2_NS = "http://www.gribuser.ru/xml/fictionbook/2.0"
 LANG_MAP = {"zh": "中文", "zho": "中文", "chi": "中文", "jpn": "日语", "eng": "英语",
             "kor": "韩语", "fra": "法语", "deu": "德语", "rus": "俄语", "spa": "西语",
             "ita": "意语"}
+
+# 正文插图标记:不可见控制字符包裹 zip 内图片路径,独占一行。
+# Lua 端按行扫描,若当前可视区首行是标记则整页显示图片,否则显示文本。
+IMG_MARK = "\x1fIMG:"  # 行内以 \x1fIMG:<path>\x1f 结尾
+IMG_MARK_END = "\x1f"
+
+
+def img_mark_line(zip_path: str) -> str:
+    return IMG_MARK + zip_path + IMG_MARK_END
 
 
 # ==================== 格式检测 ====================
@@ -92,8 +103,13 @@ def strip_ns(tag: str) -> str:
 def join_path(base: str, href: str) -> str:
     href = urllib.parse.unquote(href.split("#", 1)[0])
     path = f"{base}/{href}" if base else href
-    path = re.sub(r"/{2,}", "/", path)
+    path = posixpath.normpath(path)
     return path.lstrip("/")
+
+
+def opf_dir(opf_path: str) -> str:
+    """OPF 所在目录;OPF 在压缩包根目录时返回空串,不能返回文件名本身。"""
+    return opf_path.rsplit("/", 1)[0] if "/" in opf_path else ""
 
 
 def get_metadata(zf: zipfile.ZipFile, opf_path: str) -> dict:
@@ -112,7 +128,7 @@ def get_metadata(zf: zipfile.ZipFile, opf_path: str) -> dict:
 
 def find_cover(zf: zipfile.ZipFile, opf_path: str):
     root = ET.fromstring(zf.read(opf_path))
-    base = opf_path.rsplit("/", 1)[0]
+    base = opf_dir(opf_path)
     manifest = {}
     cover_id = None
     for el in root.iter():
@@ -148,9 +164,25 @@ def epub_cover(path: str, out_path: str) -> int:
         return 0
 
 
-def html_to_text(raw) -> str:
+def html_to_text(raw, zf=None, base="") -> str:
     txt = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
     txt = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", txt)
+
+    # 插图:把 <img> 替换为独占一行的标记,供 Lua 端整页显示。
+    # src 相对 xhtml 所在 zip 目录;图片不在包内则丢弃该标签。
+    # 注:SVG <image xlink:href> 插页(口絵/扉页)暂不处理,后续再做。
+    def img_repl(m):
+        tag = m.group(0)
+        sm = re.search(r'\bsrc\s*=\s*["\']([^"\']+)["\']', tag, re.I)
+        if not sm:
+            return ""
+        zpath = join_path(base, sm.group(1))
+        if zf is not None and zpath not in zf.namelist():
+            return ""
+        return "\n" + img_mark_line(zpath) + "\n"
+
+    txt = re.sub(r"(?is)<img\b[^>]*>", img_repl, txt)
+
     txt = re.sub(r"(?i)</(p|div|h[1-6]|li|br|tr|blockquote|section|article)>", "\n", txt)
     txt = re.sub(r"(?i)<br\s*/?>", "\n", txt)
     txt = re.sub(r"<[^>]+>", "", txt)
@@ -162,12 +194,14 @@ def html_to_text(raw) -> str:
     txt = re.sub(r"&#(\d+);", lambda m: chr(int(m.group(1))), txt)
     txt = re.sub(r"[ \t]+\n", "\n", txt)
     txt = re.sub(r"\n{3,}", "\n\n", txt)
-    return txt.strip()
+    # 不能裸 strip():\x1f 控制字符会被 Unicode 规则当空白剥掉,
+    # 插图标记行会失去 \x1fIMG: 前缀。只剥常规空白。
+    return txt.strip(" \t\r\n")
 
 
 def chapter_texts(zf: zipfile.ZipFile, opf_path: str):
     root = ET.fromstring(zf.read(opf_path))
-    base = opf_path.rsplit("/", 1)[0]
+    base = opf_dir(opf_path)
     manifest, candidates = {}, []
     for el in root.iter():
         if not isinstance(el.tag, str):
@@ -184,10 +218,12 @@ def chapter_texts(zf: zipfile.ZipFile, opf_path: str):
                       if n.lower().endswith((".xhtml", ".html", ".htm"))]
     for href in candidates:
         try:
-            raw = zf.read(join_path(base, href))
+            xpath = join_path(base, href)
+            raw = zf.read(xpath)
         except KeyError:
             continue
-        text = html_to_text(raw)
+        # 图片 src 相对 xhtml 所在目录解析
+        text = html_to_text(raw, zf=zf, base=posixpath.dirname(xpath))
         if text.strip():
             yield text
 
@@ -206,8 +242,9 @@ def epub_body_text(path: str) -> str:
     with zipfile.ZipFile(path) as zf:
         opf = find_opf(zf)
         parts = [t for t in chapter_texts(zf, opf)]
-    # 跳过封面/版权等短章节,拼接全书正文
-    body = "\n\n".join(t for t in parts if len(t) > 200)
+    # 跳过封面/版权等短章节,拼接全书正文。
+    # 含插图的短章节(口絵/插页)必须保留,否则正文插图会消失。
+    body = "\n\n".join(t for t in parts if len(t) > 200 or IMG_MARK in t)
     return body or "(未找到正文)"
 
 
@@ -249,11 +286,18 @@ class Mobi:
             raise MobiError("不是 Mobipocket 书(record 0 无 MOBI 标识)")
         self.mobi_pos = mobi
         self.compression = struct.unpack_from(">H", r0, base + 0x00)[0]
+        self.text_record_count = struct.unpack_from(">H", r0, base + 0x08)[0]
         self.encoding = struct.unpack_from(">I", r0, mobi + 0x0C)[0]
         self.header_length = struct.unpack_from(">I", r0, mobi + 0x04)[0]
-        self.first_image_index = struct.unpack_from(">I", r0, mobi + 0x64)[0]
-        self.full_name_off = struct.unpack_from(">I", r0, mobi + 0x4C)[0]
-        self.full_name_len = struct.unpack_from(">I", r0, mobi + 0x50)[0]
+        # 以下字段的官方偏移以 MOBI magic 为基准。旧实现整体多偏了 8 字节，
+        # 会把 HUFF record count(3)误当 first_image_index。
+        self.full_name_off = struct.unpack_from(">I", r0, mobi + 0x44)[0]
+        self.full_name_len = struct.unpack_from(">I", r0, mobi + 0x48)[0]
+        self.first_image_index = struct.unpack_from(">I", r0, mobi + 0x5C)[0]
+        self.huff_offset = struct.unpack_from(">I", r0, mobi + 0x60)[0]
+        self.huff_count = struct.unpack_from(">I", r0, mobi + 0x64)[0]
+        self.extra_flags = (struct.unpack_from(">H", r0, base + 0xF2)[0]
+                            if self.header_length >= 0xE4 and len(r0) >= base + 0xF4 else 0)
         if self.full_name_off and self.full_name_len:
             try:
                 self.title = r0[self.full_name_off:self.full_name_off + self.full_name_len] \
@@ -299,32 +343,71 @@ class Mobi:
             "tags": first(105),
         }
 
+    def record_data(self, index: int) -> bytes:
+        if not 0 <= index < self.num_records:
+            raise MobiError(f"记录索引越界: {index}")
+        end = self.records[index + 1] if index + 1 < self.num_records else len(self.data)
+        return self.data[self.records[index]:end]
+
+    def trim_trailing_entries(self, data: bytes) -> bytes:
+        """按 MOBI extra_flags 去掉文本记录尾部的索引/多字节重叠数据。"""
+        size = len(data)
+        removed = 0
+        flags = self.extra_flags >> 1
+        while flags:
+            if flags & 1:
+                pos = size - removed
+                bitpos = result = 0
+                while pos > 0 and bitpos < 28:
+                    pos -= 1
+                    value = data[pos]
+                    result |= (value & 0x7F) << bitpos
+                    bitpos += 7
+                    if value & 0x80:
+                        break
+                if result <= 0 or result > size - removed:
+                    return data
+                removed += result
+            flags >>= 1
+        if self.extra_flags & 1 and size > removed:
+            removed += (data[size - removed - 1] & 0x03) + 1
+        return data[:size - removed] if 0 < removed <= size else data
+
     def body_html(self, max_records: int = 0) -> str:
-        """解压正文记录拼成 HTML 流(到第一条图片记录或 first_image_index)。
-        max_records=0 表示不限;compression=2 是 PalmDoc 压缩(mobi 变体,
-        见 calibre headers.py 与 palmdoc.c);KF8/azw3 每条记录是独立 XML
-        片段,去掉 xml 声明与 head 段。first_image_index 可能为 0,此时
-        用第一条图片 magic 记录的位置作为正文边界,避免解压图片记录。
+        """按 PalmDOC 头声明的正文记录数解压正文。
+
+        支持 compression=1(无压缩)、2(PalmDoc)、17480(HUFF/CDIC)。正文
+        不能按 first_image_index 截断:正文和图片之间可能夹着 INDX/FDST 等记录。
         """
-        end = self.first_image_index or self.num_records
-        if end == self.num_records:
-            imgs = self.image_records()
-            if imgs:
-                end = imgs[0][0]
-        if end <= 1:
-            return ""
+        end = min(1 + self.text_record_count, self.num_records)
         if max_records > 0:
             end = min(end, max_records + 1)
+        if end <= 1:
+            return ""
+
+        unpack = lambda raw: raw
+        if self.compression == 2:
+            unpack = palmdoc_decompress
+        elif self.compression == 17480:
+            if not self.huff_count or self.huff_offset + self.huff_count > self.num_records:
+                raise MobiError("HUFF/CDIC 词典记录位置损坏")
+            unpack = HuffCdicReader([
+                self.record_data(i)
+                for i in range(self.huff_offset, self.huff_offset + self.huff_count)
+            ]).unpack
+        elif self.compression != 1:
+            raise MobiError(f"不支持的 MOBI 压缩类型: {self.compression}")
+
         chunks = []
         for i in range(1, end):
-            nxt = self.records[i + 1] if i + 1 < self.num_records else len(self.data)
-            raw = self.data[self.records[i]:nxt]
-            if self.compression == 2:
-                raw = palmdoc_decompress(raw)
+            raw = self.trim_trailing_entries(self.record_data(i))
+            raw = unpack(raw)
             raw = re.sub(rb"<\?xml[^>]*\?>", b"", raw)
             raw = re.sub(rb"(?is)<head[^>]*>.*?</head>", b"", raw)
             chunks.append(raw)
-        html = b"".join(chunks)
+        html = b"".join(chunks).replace(b"\x00", b"")
+        if html.endswith(b"#"):
+            html = html[:-1]
         enc = "utf-8" if self.encoding == 65001 else "cp1252"
         return html.decode(enc, "replace")
 
@@ -358,6 +441,102 @@ class Mobi:
             if len(data) > 10240:
                 return data
         return imgs[0][1]
+
+
+class HuffCdicReader:
+    """MOBI HUFF/CDIC 解压器，纯标准库实现。"""
+
+    def __init__(self, records):
+        if not records:
+            raise MobiError("缺少 HUFF 记录")
+        self._load_huff(records[0])
+        for record in records[1:]:
+            self._load_cdic(record)
+
+    def _load_huff(self, data):
+        if data[:8] != b"HUFF\x00\x00\x00\x18":
+            raise MobiError("无效 HUFF 记录")
+        off1, off2 = struct.unpack_from(">II", data, 8)
+        if off1 + 1024 > len(data) or off2 + 256 > len(data):
+            raise MobiError("HUFF 表越界")
+        table1 = []
+        for value in struct.unpack_from(">256I", data, off1):
+            length, terminal, maximum = value & 0x1F, bool(value & 0x80), value >> 8
+            if not length:
+                raise MobiError("HUFF 码长为 0")
+            maximum = ((maximum + 1) << (32 - length)) - 1
+            table1.append((length, terminal, maximum))
+        self.table1 = table1
+
+        table2 = struct.unpack_from(">64I", data, off2)
+        self.mincode = [0] * 33
+        self.maxcode = [0] * 33
+        for length in range(1, 33):
+            self.mincode[length] = table2[(length - 1) * 2] << (32 - length)
+            self.maxcode[length] = ((table2[(length - 1) * 2 + 1] + 1)
+                                    << (32 - length)) - 1
+        self.dictionary = []
+        self.expanding = set()
+
+    def _load_cdic(self, data):
+        if data[:8] != b"CDIC\x00\x00\x00\x10":
+            raise MobiError("无效 CDIC 记录")
+        phrases, bits = struct.unpack_from(">II", data, 8)
+        count = min(1 << bits, phrases - len(self.dictionary))
+        if count < 0 or 16 + count * 2 > len(data):
+            raise MobiError("CDIC 词典表越界")
+        for offset in struct.unpack_from(f">{count}H", data, 16):
+            if 18 + offset > len(data):
+                raise MobiError("CDIC 词条偏移越界")
+            length = struct.unpack_from(">H", data, 16 + offset)[0]
+            size = length & 0x7FFF
+            end = 18 + offset + size
+            if end > len(data):
+                raise MobiError("CDIC 词条内容越界")
+            self.dictionary.append((data[18 + offset:end], bool(length & 0x8000)))
+
+    def _phrase(self, index):
+        if not 0 <= index < len(self.dictionary):
+            raise MobiError(f"HUFF 词典索引越界: {index}")
+        data, expanded = self.dictionary[index]
+        if expanded:
+            return data
+        if index in self.expanding:
+            raise MobiError("HUFF 词典出现循环引用")
+        self.expanding.add(index)
+        try:
+            data = self.unpack(data)
+            self.dictionary[index] = (data, True)
+            return data
+        finally:
+            self.expanding.discard(index)
+
+    def unpack(self, data):
+        bits_left = len(data) * 8
+        padded = data + b"\x00" * 8
+        pos, available = 0, 32
+        window = struct.unpack_from(">Q", padded, 0)[0]
+        output = []
+        while True:
+            if available <= 0:
+                pos += 4
+                window = struct.unpack_from(">Q", padded, pos)[0]
+                available += 32
+            code = (window >> available) & 0xFFFFFFFF
+            length, terminal, maximum = self.table1[code >> 24]
+            if not terminal:
+                while length <= 32 and code < self.mincode[length]:
+                    length += 1
+                if length > 32:
+                    raise MobiError("无效 HUFF 码")
+                maximum = self.maxcode[length]
+            available -= length
+            bits_left -= length
+            if bits_left < 0:
+                break
+            index = (maximum - code) >> (32 - length)
+            output.append(self._phrase(index))
+        return b"".join(output)
 
 
 def palmdoc_decompress(data: bytes) -> bytes:
@@ -617,7 +796,8 @@ def cmd_text(args):
                 body = f.read()
         else:
             body = body_text(path, kind)
-            if cache:
+            # 解析失败/为空的结果不能进缓存,否则脚本修复后旧缓存仍返回错误内容
+            if cache and body and not body.startswith("(未找到"):
                 try:
                     tmp = cache + ".tmp"
                     with open(tmp, "w", encoding="utf-8") as f:
@@ -628,14 +808,58 @@ def cmd_text(args):
     except Exception as e:
         print(f"[epub-preview] text 失败: {e}")
         return 2
-    lines = body.split("\n")
-    if start_line >= len(lines):
+    # job.skip 是终端上的"显示行"偏移,不能先按电子书的原始段落行切片。
+    # 否则一条折成 2~5 行的段落会被当成 1 行跨过,造成滚轮偶发大跳。
+    # 插图标记行占 1 行;其后的空行合并掉,保证"图片页 → 下一格 → 图片后
+    # 正文第一行"(否则图片后先出现一个空行页,正文被挤到第二格)。
+    display_lines = []
+    after_img = False
+    for ln in body.split("\n"):
+        if ln.startswith(IMG_MARK):
+            display_lines.append(ln)
+            after_img = True
+        elif after_img and ln == "":
+            after_img = False
+            continue  # 跳过图片标记行后的空行
+        else:
+            after_img = False
+            display_lines.extend(wrap_by_width(ln, width))
+    if start_line >= len(display_lines):
         print("(已到正文末尾)")
         return 0
-    out = []
-    for ln in lines[start_line:start_line + max_lines]:
-        out.extend(wrap_by_width(ln, width))
-    print("\n".join(out))
+    print("\n".join(display_lines[start_line:start_line + max_lines]))
+    return 0
+
+
+def cmd_img(args):
+    """img <file> <zip路径> <缓存目录> —— 提取正文插图到缓存文件,stdout 输出文件路径。"""
+    if len(args) < 3:
+        print("用法: epub-preview img <file> <zip路径> <缓存目录>", file=sys.stderr)
+        return 2
+    path, zip_path, cache_dir = args[0], args[1], args[2]
+    try:
+        with zipfile.ZipFile(path) as zf:
+            data = zf.read(zip_path)
+    except Exception as e:
+        print(f"[epub-preview] img 失败: {e}", file=sys.stderr)
+        return 1
+    ext = os.path.splitext(zip_path)[1] or ".img"
+    h = hashlib.md5((path + "\x00" + zip_path).encode("utf-8")).hexdigest()
+    # ya.file_cache 返回 <cache_dir>/<hex> 文件路径(无扩展名),真正可写的
+    # 目录是其父目录;若调用方直接传了目录则原样使用。
+    out_dir = cache_dir if os.path.isdir(cache_dir) else os.path.dirname(cache_dir) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, f"img-{h}{ext}")
+    if not os.path.exists(out):
+        try:
+            tmp = out + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, out)
+        except OSError as e:
+            print(f"[epub-preview] img 缓存失败: {e}", file=sys.stderr)
+            return 1
+    print(out)
     return 0
 
 
@@ -650,6 +874,8 @@ def main():
         return cmd_meta(args)
     if cmd == "text":
         return cmd_text(args)
+    if cmd == "img":
+        return cmd_img(args)
     print(f"未知子命令: {cmd}", file=sys.stderr)
     return 2
 

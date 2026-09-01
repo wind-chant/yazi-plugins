@@ -1,14 +1,14 @@
 # epub-preview.yazi
 
-Yazi 电子书分页预览插件:**封面 → 元信息(标题/作者/出版社等)→ 正文开头**,滚动(`J`/`K`)切换页面,按需加载。
+Yazi 电子书分页预览插件:**封面 → 元信息(标题/作者/出版社等) → 完整正文**。鼠标滚轮逐显示行滚动，`J`/`K` 整页翻动。
 
 支持格式:
 
 | 格式 | 解析方式 | 元信息 | 封面 | 正文 |
 |---|---|---|---|---|
-| epub | Python 标准库(zip + OPF) | Dublin Core | OPF cover | 按 spine 取第一章 |
-| mobi | 标准库(PalmDB + MOBI header + EXTH) | EXTH 100/101/503/524 等 | EXTH 201 + 图像记录 | PalmDoc(mobi 变体)解压 |
-| azw3 | 同 mobi(KF8 分片) | 同上 | 同上 | 同上 |
+| epub | Python 标准库(zip + OPF) | Dublin Core | OPF cover | 完整 spine；支持普通 `<img>` 正文插图 |
+| mobi | 标准库(PalmDB + MOBI header + EXTH) | EXTH 100/101/503/524 等 | EXTH 201 + 图像记录 | 无压缩 / PalmDoc / HUFF-CDIC |
+| azw3 | 同 mobi(KF8 分片) | 同上 | 同上 | 无压缩 / PalmDoc / HUFF-CDIC |
 | fb2 | 标准库(FictionBook XML) | description/title-info | binary base64 | body 段落 |
 
 **零第三方依赖、零外部命令**(不需要 calibre / pandoc / epr)。
@@ -50,18 +50,21 @@ prepend_previewers = [
 
 1. **封面**(自动提取,缓存到 yazi 缓存目录;无封面自动跳到元信息页)
 2. 按 `J` → **元信息**:标题 / 作者 / 出版社 / 标签 / 语言 / 日期
-3. 按 `J` → **正文开头**(自动跳过封面/版权页,取第一章)
-4. 按 `K` 往回翻页
+3. 按 `J` → **完整正文**(自动跳过短封面/版权页)
+4. 正文中鼠标滚轮逐显示行滚动，`J`/`K` 整页翻动
+5. EPUB 普通 `<img>` 插图滚到顶部时整页显示；SVG 口絵/扉页暂不处理
 
 ## 实现说明
 
-- `main.lua`:分页状态用 `ya.sync` 持久表按文件 URL 记录;seek 换页后 `ya.emit("peek", ...)` 触发重绘(参照内置 `code` 预览器模式)
-- `scripts/epub-preview`:单文件 Python 脚本,三个子命令 `cover` / `meta` / `text`,按格式自动分发
-- 性能:epub ~30ms / mobi ~37ms 每次;封面、元信息、正文转换结果均缓存在 `ya.file_cache` 目录
+- `main.lua`:分页状态编码在 Yazi 管理的 `job.skip` 中；`seek` 后通过 `ya.emit("peek", ...)` 重绘，不依赖跨 Lua state 的 `ya.sync`
+- `scripts/epub-preview`:单文件 Python 脚本，提供 `cover` / `meta` / `text` / `img` 子命令并按格式自动分发
+- 正文先按终端显示宽度完整折行，再按 `job.skip` 切片；Lua 保留空行，保证滚轮偏移与可视行一一对应
+- 封面、元信息和完整正文缓存在 Yazi 临时缓存目录；解析失败结果不写缓存
 - mobi 解析要点(均对照 calibre 官方源码 `palmdoc.c` / `headers.py` 验证):
-  - `compression=2` 是 **PalmDoc 压缩**(17480 才是 HUFF/CDIC)
+  - `compression=2` 是 **PalmDoc 压缩**；`17480` 是 **HUFF/CDIC**，两者均已支持
   - PalmDoc 的 mobi 变体:`0x80-0xBF` 为 2 字节重复码,`0xC0-0xFF` 为「空格+大写字母」编码
   - record 0 存在有无 `BOOKMOBI` magic 两种布局,MOBI 标识位于 0x10
+  - 正文范围来自 PalmDOC 的 `text_record_count`；HUFF/CDIC 解压前按 `extra_flags` 去除尾部附加数据
   - EXTH 不能依赖 flags 判断;封面 = EXTH 201 偏移 + 第一条图像记录
 
 ## License
